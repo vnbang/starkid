@@ -26,6 +26,18 @@ function sanitizeStreamKey(string $key): string {
     return $key;
 }
 
+function isFunctionEnabled(string $name): bool {
+    if (!function_exists($name)) return false;
+    $disabled = ini_get('disable_functions') ?: '';
+    $list = array_map('trim', explode(',', $disabled));
+    return !in_array($name, $list, true);
+}
+
+function shellQuote(string $value): string {
+    // Tương đương cơ bản với escapeshellarg nhưng không phụ thuộc hàm bị chặn
+    return "'" . str_replace("'", "'\\''", $value) . "'";
+}
+
 function getStreamPaths(string $streamKey): array {
     global $hlsBaseDir, $logsBaseDir;
     $streamDir = $hlsBaseDir . '/' . $streamKey;
@@ -44,10 +56,33 @@ function getStreamPaths(string $streamKey): array {
 
 function isProcessRunning(int $pid): bool {
     if ($pid <= 0) return false;
-    if (function_exists('posix_kill')) {
+    if (isFunctionEnabled('posix_kill')) {
         return @posix_kill($pid, 0);
     }
     return file_exists('/proc/' . $pid);
+}
+
+function buildFfmpegCommand(string $rtspUrl, array $paths, array $options): string {
+    $rtspTransport = $options['rtsp_transport'] ?? 'tcp';
+    $copyVideo = $options['copy_video'] ?? true; // copy codec H.264 nếu có
+    $includeAudio = $options['audio'] ?? false; // mặc định tắt audio cho ổn định
+    $hlsTime = (int)($options['hls_time'] ?? 2);
+    $hlsListSize = (int)($options['hls_list_size'] ?? 6);
+
+    $videoCodec = $copyVideo ? '-c:v copy' : '-c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -g ' . (int)($hlsListSize * $hlsTime * 2);
+    $audioCodec = $includeAudio ? '-c:a aac -b:a 128k -ar 44100' : '-an';
+
+    $ffmpeg = 'ffmpeg';
+    $safeRtsp = shellQuote($rtspUrl);
+    $safePlaylist = shellQuote($paths['playlist']);
+    $safeSegment = shellQuote($paths['segment']);
+
+    $cmd = "{$ffmpeg} -nostdin -rtsp_transport {$rtspTransport} -stimeout 15000000 -i {$safeRtsp} ";
+    $cmd .= "-fflags nobuffer -flags low_delay -frag_duration 2000000 ";
+    $cmd .= "$videoCodec $audioCodec -f hls -hls_time {$hlsTime} -hls_list_size {$hlsListSize} ";
+    $cmd .= "-hls_flags delete_segments+append_list+program_date_time -hls_segment_type mpegts ";
+    $cmd .= "-hls_segment_filename {$safeSegment} {$safePlaylist}";
+    return $cmd;
 }
 
 function startStream(string $streamKey, string $rtspUrl, array $options = []): array {
@@ -63,31 +98,50 @@ function startStream(string $streamKey, string $rtspUrl, array $options = []): a
         @unlink($oldFile);
     }
 
-    $rtspTransport = $options['rtsp_transport'] ?? 'tcp';
-    $copyVideo = $options['copy_video'] ?? true; // copy codec H.264 nếu có
-    $includeAudio = $options['audio'] ?? false; // mặc định tắt audio cho ổn định
-    $hlsTime = (int)($options['hls_time'] ?? 2);
-    $hlsListSize = (int)($options['hls_list_size'] ?? 6);
+    $cmd = buildFfmpegCommand($rtspUrl, $paths, $options);
+    $logRedir = ' > ' . shellQuote($paths['log']) . ' 2>&1';
 
-    $videoCodec = $copyVideo ? '-c:v copy' : '-c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -g ' . (int)($hlsListSize * $hlsTime * 2);
-    $audioCodec = $includeAudio ? '-c:a aac -b:a 128k -ar 44100' : '-an';
+    $canShellExec = isFunctionEnabled('shell_exec');
+    $canProcOpen = isFunctionEnabled('proc_open') && isFunctionEnabled('proc_close');
 
-    $ffmpeg = 'ffmpeg';
-    $safeRtsp = escapeshellarg($rtspUrl);
-    $safePlaylist = escapeshellarg($paths['playlist']);
-    $safeSegment = escapeshellarg($paths['segment']);
-    $safeLog = escapeshellarg($paths['log']);
+    if (!$canShellExec && !$canProcOpen) {
+        $full = $cmd . $logRedir . ' &';
+        return [
+            'ok' => false,
+            'message' => "Hosting chặn thực thi shell (shell_exec/proc_open). Hãy chạy lệnh này qua SSH để khởi động:\n" . $full
+        ];
+    }
 
-    $cmd = "{$ffmpeg} -nostdin -rtsp_transport {$rtspTransport} -stimeout 15000000 -i {$safeRtsp} ";
-    $cmd .= "-fflags nobuffer -flags low_delay -frag_duration 2000000 ";
-    $cmd .= "$videoCodec $audioCodec -f hls -hls_time {$hlsTime} -hls_list_size {$hlsListSize} ";
-    $cmd .= "-hls_flags delete_segments+append_list+program_date_time -hls_segment_type mpegts ";
-    $cmd .= "-hls_segment_filename {$safeSegment} {$safePlaylist}";
+    // Ưu tiên proc_open để lấy PID chuẩn
+    if ($canProcOpen) {
+        $descriptor = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+        $bashCmd = 'bash -c ' . shellQuote("nohup {$cmd}{$logRedir} & echo \\$!");
+        $process = @proc_open($bashCmd, $descriptor, $pipes);
+        if (is_resource($process)) {
+            @fclose($pipes[0]);
+            $pidOutput = stream_get_contents($pipes[1]);
+            @fclose($pipes[1]);
+            // Ghi stderr của bash nếu cần debug
+            $stderr = stream_get_contents($pipes[2]);
+            @fclose($pipes[2]);
+            @proc_close($process);
+            $pid = (int)trim($pidOutput);
+            if ($pid > 0) {
+                file_put_contents($paths['pid'], (string)$pid);
+                return ['ok' => true, 'pid' => $pid, 'streamKey' => $streamKey, 'message' => 'Started'];
+            }
+            return ['ok' => false, 'message' => 'Không thể khởi động FFmpeg (proc_open). ' . ($stderr ? ('STDERR: ' . $stderr) : 'Xem log: ' . $paths['log'])];
+        }
+        return ['ok' => false, 'message' => 'proc_open không thể khởi tạo'];
+    }
 
-    // Chạy nền và lấy PID của chính tiến trình FFmpeg
-    $background = 'bash -c ' . escapeshellarg("nohup {$cmd} > {$paths['log']} 2>&1 & echo \\$!") . ' 2>/dev/null';
-    $pid = (int)trim(shell_exec($background));
-
+    // Fallback shell_exec (nếu được phép)
+    $background = 'bash -c ' . shellQuote("nohup {$cmd}{$logRedir} & echo \\$!") . ' 2>/dev/null';
+    $pid = (int)trim(@shell_exec($background));
     if ($pid > 0) {
         file_put_contents($paths['pid'], (string)$pid);
         return ['ok' => true, 'pid' => $pid, 'streamKey' => $streamKey, 'message' => 'Started'];
@@ -104,11 +158,20 @@ function stopStream(string $streamKey): array {
     }
     $pid = (int)trim(@file_get_contents($paths['pid']));
     if ($pid > 0 && isProcessRunning($pid)) {
-        @shell_exec('kill ' . (int)$pid . ' 2>/dev/null');
-        // Chờ dừng trong chốc lát, nếu chưa thì KILL
-        usleep(300000);
-        if (isProcessRunning($pid)) {
-            @shell_exec('kill -9 ' . (int)$pid . ' 2>/dev/null');
+        if (isFunctionEnabled('posix_kill')) {
+            @posix_kill($pid, 15);
+            usleep(300000);
+            if (isProcessRunning($pid)) {
+                @posix_kill($pid, 9);
+            }
+        } elseif (isFunctionEnabled('shell_exec')) {
+            @shell_exec('kill ' . (int)$pid . ' 2>/dev/null');
+            usleep(300000);
+            if (isProcessRunning($pid)) {
+                @shell_exec('kill -9 ' . (int)$pid . ' 2>/dev/null');
+            }
+        } else {
+            return ['ok' => false, 'message' => 'Không thể dừng do hosting chặn posix_kill và shell_exec. Hãy SSH và chạy: kill ' . $pid];
         }
     }
     @unlink($paths['pid']);
@@ -134,7 +197,6 @@ function listStreams(): array {
         ];
     }
 
-    // Bổ sung các thư mục HLS không có pid (đã dừng hoặc được tạo sẵn)
     foreach (glob($hlsBaseDir . '/*', GLOB_ONLYDIR) ?: [] as $dir) {
         $streamKey = basename($dir);
         if (!isset($streams[$streamKey])) {
@@ -155,6 +217,14 @@ function listStreams(): array {
 }
 
 $resultMessage = '';
+$hostingRestrictions = [];
+if (!isFunctionEnabled('shell_exec')) $hostingRestrictions[] = 'shell_exec';
+if (!isFunctionEnabled('proc_open')) $hostingRestrictions[] = 'proc_open';
+if (!isFunctionEnabled('escapeshellarg')) $hostingRestrictions[] = 'escapeshellarg';
+if (!empty($hostingRestrictions)) {
+    $resultMessage = 'Chú ý: Hosting đang chặn ' . implode(', ', $hostingRestrictions) . '. Một số chức năng start/stop từ PHP có thể không hoạt động.';
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     $streamKey = sanitizeStreamKey($_POST['stream_key'] ?? '');
@@ -170,7 +240,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'copy_video' => $copyVideo,
                     'audio' => $includeAudio,
                 ]);
-                $resultMessage = $res['message'] ?? ($res['ok'] ? 'Đã khởi động' : 'Lỗi không xác định');
+                if (!$res['ok'] && isset($res['message'])) {
+                    $resultMessage = $res['message'];
+                } else {
+                    $resultMessage = $res['message'] ?? ($res['ok'] ? 'Đã khởi động' : 'Lỗi không xác định');
+                }
             }
         } elseif ($action === 'stop') {
             $res = stopStream($streamKey);
@@ -197,7 +271,7 @@ $streams = listStreams();
 		.btn-primary { background: #2563eb; color: white; }
 		.btn-danger { background: #ef4444; color: white; }
 		.hint { font-size: 12px; color: #94a3b8; }
-		.msg { margin-top: 10px; font-size: 13px; color: #fcd34d; }
+		.msg { margin-top: 10px; font-size: 13px; color: #fcd34d; white-space: pre-wrap; }
 		.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px,1fr)); gap: 12px; }
 		.player { background: #0b1220; border: 1px solid #1f2937; border-radius: 10px; overflow: hidden; }
 		video { width: 100%; height: 220px; background: black; }
